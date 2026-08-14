@@ -1,0 +1,25 @@
+{
+  "name": "OpenTelemetry, Prometheus, and Grafana Lab",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false
+    }
+  },
+  "forwardPorts": [3000, 3001, 9090],
+  "portsAttributes": {
+    "3000": {
+      "label": "Lab 5 app"
+    },
+    "3001": {
+      "label": "Grafana"
+    },
+    "9090": {
+      "label": "Prometheus"
+    }
+  },
+  "postCreateCommand": "npm ci",
+  "postStartCommand": "./scripts/start-lab"
+}

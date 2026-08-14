@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root" || exit 1
+
+failures=0
+stack_attempted=false
+temporary_directory=$(mktemp -d)
+
+cleanup() {
+  if [[ "$stack_attempted" == true ]]; then
+    docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+  fi
+  rm --recursive --force -- "$temporary_directory"
+}
+trap cleanup EXIT
+
+record_failure() {
+  printf 'FAIL: %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
+
+for command in curl docker node npm; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    record_failure "$command is not available; reopen this repository in its devcontainer"
+  fi
+done
+
+if ((failures > 0)); then
+  printf '\nLab check stopped because required tools are unavailable.\n' >&2
+  exit 1
+fi
+
+instruments_valid=false
+if node - <<'NODE'
+"use strict";
+
+const { registerInstruments } = require("./src/instruments");
+
+const counter = { add() {} };
+const histogram = { record() {} };
+const calls = { counters: [], histograms: [] };
+const meter = {
+  createCounter(name, options) {
+    calls.counters.push({ name, options });
+    return counter;
+  },
+  createHistogram(name, options) {
+    calls.histograms.push({ name, options });
+    return histogram;
+  },
+};
+
+try {
+  const result = registerInstruments(meter);
+  if (calls.counters.length !== 1 || calls.counters[0].name !== "lab05_requests") {
+    throw new Error("create exactly one counter named lab05_requests");
+  }
+  if (
+    calls.histograms.length !== 1 ||
+    calls.histograms[0].name !== "lab05_request_duration"
+  ) {
+    throw new Error("create exactly one histogram named lab05_request_duration");
+  }
+  if (calls.histograms[0].options?.unit !== "s") {
+    throw new Error("create the histogram with unit s");
+  }
+  const keys = result && typeof result === "object" ? Object.keys(result).sort() : [];
+  if (JSON.stringify(keys) !== JSON.stringify(["requestCounter", "requestDuration"])) {
+    throw new Error("return exactly { requestCounter, requestDuration }");
+  }
+  if (result.requestCounter !== counter || result.requestDuration !== histogram) {
+    throw new Error("return the two instruments created by the supplied meter");
+  }
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+NODE
+then
+  instruments_valid=true
+else
+  record_failure "src/instruments.js does not satisfy the required instrument contract"
+fi
+
+request_rate_expression=""
+request_p95_expression=""
+queries_valid=true
+
+if [[ -f lab05/request-rate.promql ]]; then
+  request_rate_expression=$(<lab05/request-rate.promql)
+  request_rate_compact=$(node -e \
+    'process.stdout.write(process.argv[1].replace(/\s/g, ""))' \
+    "$request_rate_expression")
+  if [[ "$request_rate_compact" != 'sumby(status)(rate(lab05_requests_total[2m]))' ]]; then
+    record_failure "lab05/request-rate.promql does not contain the required request-rate expression"
+    queries_valid=false
+  fi
+else
+  record_failure "lab05/request-rate.promql is missing"
+  queries_valid=false
+fi
+
+if [[ -f lab05/request-p95.promql ]]; then
+  request_p95_expression=$(<lab05/request-p95.promql)
+  request_p95_compact=$(node -e \
+    'process.stdout.write(process.argv[1].replace(/\s/g, ""))' \
+    "$request_p95_expression")
+  if [[ "$request_p95_compact" != 'histogram_quantile(0.95,sumby(le)(rate(lab05_request_duration_seconds_bucket[2m])))' ]]; then
+    record_failure "lab05/request-p95.promql does not contain the required p95 expression"
+    queries_valid=false
+  fi
+else
+  record_failure "lab05/request-p95.promql is missing"
+  queries_valid=false
+fi
+
+if [[ ! -f lab05/dashboard.json ]]; then
+  record_failure "lab05/dashboard.json is missing"
+elif ! node - lab05/dashboard.json "$request_rate_expression" "$request_p95_expression" <<'NODE'
+"use strict";
+
+const fs = require("node:fs");
+const [dashboardPath, rateExpression, p95Expression] = process.argv.slice(2);
+const normalize = expression => expression.replace(/\s/g, "");
+
+function allPanels(panels) {
+  if (!Array.isArray(panels)) return [];
+  return panels.flatMap(panel => [panel, ...allPanels(panel.panels)]);
+}
+
+try {
+  const dashboard = JSON.parse(fs.readFileSync(dashboardPath, "utf8"));
+  if (!dashboard || typeof dashboard !== "object" || Array.isArray(dashboard)) {
+    throw new Error("the Classic export must be a dashboard JSON object");
+  }
+  if (dashboard.dashboard && !dashboard.panels) {
+    throw new Error("export the Classic JSON model, not an API wrapper");
+  }
+
+  const acceptedExpressions = new Set([
+    normalize(rateExpression),
+    normalize(p95Expression),
+  ]);
+  const matchingPanel = allPanels(dashboard.panels).find(panel =>
+    panel?.type === "timeseries" &&
+    typeof panel.title === "string" &&
+    panel.title.trim().length > 0 &&
+    Array.isArray(panel.targets) &&
+    panel.targets.some(target =>
+      typeof target?.expr === "string" &&
+      acceptedExpressions.has(normalize(target.expr)),
+    )
+  );
+
+  if (!matchingPanel) {
+    throw new Error(
+      "include a titled time-series panel backed by one completed lab query",
+    );
+  }
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+NODE
+then
+  record_failure "lab05/dashboard.json is not the required Classic dashboard export"
+fi
+
+# The live checks depend on valid instruments and queries. Skipping them for the
+# starter avoids making the expected failing baseline wait through scrape timeouts.
+if [[ "$instruments_valid" == true && "$queries_valid" == true ]]; then
+  stack_attempted=true
+  printf '\nStarting the pinned lab stack...\n'
+  if ! docker compose up --detach --build --wait; then
+    record_failure "the pinned Docker Compose stack did not become healthy"
+  else
+    if ! LAB05_STACK_READY=1 ./scripts/generate-traffic; then
+      record_failure "the deterministic traffic generator did not complete"
+    fi
+
+    request_host=""
+    if curl --noproxy '*' --fail --silent --max-time 0.5 \
+      http://127.0.0.1:3000/health >/dev/null 2>&1; then
+      request_host=127.0.0.1
+    elif getent hosts host.docker.internal >/dev/null 2>&1 && \
+      curl --noproxy '*' --fail --silent --max-time 0.5 \
+        http://host.docker.internal:3000/health >/dev/null 2>&1; then
+      request_host=host.docker.internal
+    else
+      record_failure "the running app is not reachable from the devcontainer"
+    fi
+
+    if [[ -n "$request_host" ]]; then
+      metrics_path="$temporary_directory/metrics.txt"
+      if ! curl --noproxy '*' --fail --silent --show-error \
+        "http://${request_host}:3000/metrics" > "$metrics_path"; then
+        record_failure "the app's /metrics endpoint could not be read"
+      elif ! node - "$metrics_path" <<'NODE'
+"use strict";
+
+const fs = require("node:fs");
+const metrics = fs.readFileSync(process.argv[2], "utf8");
+const samples = [];
+
+for (const line of metrics.split(/\r?\n/)) {
+  if (!line || line.startsWith("#")) continue;
+  const match = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)(?:\s+\d+)?$/);
+  if (!match) continue;
+
+  const labels = {};
+  for (const label of (match[2] || "").matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"])*)"/g)) {
+    labels[label[1]] = JSON.parse(`"${label[2]}"`);
+  }
+  samples.push({ name: match[1], labels, value: Number(match[3]) });
+}
+
+function positive(name, status) {
+  return samples.some(sample =>
+    sample.name === name &&
+    sample.labels.method === "GET" &&
+    sample.labels.status === status &&
+    Number.isFinite(sample.value) &&
+    sample.value > 0
+  );
+}
+
+try {
+  for (const status of ["200", "404"]) {
+    if (!positive("lab05_requests_total", status)) {
+      throw new Error(`lab05_requests_total lacks a positive GET ${status} sample`);
+    }
+    if (!positive("lab05_request_duration_seconds_count", status)) {
+      throw new Error(
+        `lab05_request_duration_seconds lacks a positive GET ${status} sample`,
+      );
+    }
+  }
+
+  const expectedBoundaries = [
+    "0.005", "0.01", "0.025", "0.05", "0.1",
+    "0.25", "0.5", "1", "2.5", "5",
+  ];
+  const boundaries = new Set(
+    samples
+      .filter(sample => sample.name === "lab05_request_duration_seconds_bucket")
+      .map(sample => sample.labels.le),
+  );
+  const missing = expectedBoundaries.filter(boundary => !boundaries.has(boundary));
+  if (missing.length > 0) {
+    throw new Error(`histogram is missing finite boundaries: ${missing.join(", ")}`);
+  }
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+NODE
+      then
+        record_failure "the live Prometheus samples do not satisfy the metric contract"
+      fi
+
+      query_prometheus() {
+        local label=$1
+        local expression=$2
+        local response_path="$temporary_directory/${label}.json"
+
+        if ! curl --noproxy '*' --fail --silent --show-error --get \
+          --data-urlencode "query=${expression}" \
+          "http://${request_host}:9090/api/v1/query" > "$response_path"; then
+          return 1
+        fi
+
+        node - "$response_path" <<'NODE'
+"use strict";
+
+const fs = require("node:fs");
+try {
+  const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  if (payload.status !== "success") {
+    throw new Error(payload.error || "Prometheus returned an unsuccessful response");
+  }
+  if (!Array.isArray(payload.data?.result) || payload.data.result.length === 0) {
+    throw new Error("the query returned no results");
+  }
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+NODE
+      }
+
+      if ! query_prometheus request-rate "$request_rate_expression"; then
+        record_failure "the request-rate expression did not return a live Prometheus result"
+      fi
+      if ! query_prometheus request-p95 "$request_p95_expression"; then
+        record_failure "the p95 expression did not return a live Prometheus result"
+      fi
+    fi
+  fi
+fi
+
+if ((failures > 0)); then
+  printf '\nLab check failed with %d problem(s).\n' "$failures" >&2
+  exit 1
+fi
+
+printf '\nAll Lab 5 checks passed.\n'

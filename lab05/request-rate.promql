@@ -1,0 +1,1 @@
+sum by (status) (rate(METRIC_NAME[2m]))
