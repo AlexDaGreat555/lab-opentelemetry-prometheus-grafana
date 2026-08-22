@@ -1,4 +1,4 @@
-# OpenTelemetry, Prometheus, and Grafana Lab
+# Prometheus Query Lab
 
 This repository contains the starter service and deterministic tooling for Lab 5.
 Open it in the provided devcontainer and follow the tasks on the course website.
@@ -18,10 +18,11 @@ Run the checker before making changes to see the expected failing baseline:
 ./scripts/check-lab
 ```
 
-After completing `src/instruments.js`, generate a deterministic set of requests:
+Generate the baseline or degraded traffic profile with:
 
 ```console
-./scripts/generate-traffic
+./scripts/generate-traffic baseline
+./scripts/generate-traffic degraded
 ```
 
 The traffic helper rebuilds the application first, so it always exercises the
@@ -31,6 +32,6 @@ current contents of `src/`. If the stack is not running, start it with:
 ./scripts/start-lab
 ```
 
-The only student-owned deliverables are `src/instruments.js`, the two query
-files under `lab05/`, and `lab05/dashboard.json`. Do not commit generated data
-from Prometheus or Grafana.
+The application and its OpenTelemetry instrumentation are complete.
+The only student-owned deliverable is `lab05/success-ratio.promql`.
+Do not commit generated data from Prometheus or Grafana.

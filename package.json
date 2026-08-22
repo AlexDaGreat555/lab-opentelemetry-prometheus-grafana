@@ -2,7 +2,7 @@
   "name": "lab-opentelemetry-prometheus-grafana",
   "version": "1.0.0",
   "private": true,
-  "description": "A small HTTP service for practicing OpenTelemetry metrics, PromQL, and Grafana dashboards",
+  "description": "A small HTTP service for practicing PromQL operational signals",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

@@ -13,6 +13,10 @@ app.get("/metrics", (request, response) => {
   prometheusExporter.getMetricsRequestHandler(request, response);
 });
 
+app.get("/health", (_request, response) => {
+  response.type("text/plain").send("lab05 healthy\n");
+});
+
 app.use((request, response, next) => {
   const startedAt = process.hrtime.bigint();
 
@@ -28,10 +32,6 @@ app.use((request, response, next) => {
   });
 
   next();
-});
-
-app.get("/health", (_request, response) => {
-  response.type("text/plain").send("lab05 healthy\n");
 });
 
 app.get("/work", (_request, response) => {

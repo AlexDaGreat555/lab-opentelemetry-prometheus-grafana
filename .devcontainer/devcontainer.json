@@ -1,5 +1,5 @@
 {
-  "name": "OpenTelemetry, Prometheus, and Grafana Lab",
+  "name": "Prometheus Query Lab",
   "build": {
     "dockerfile": "Dockerfile"
   },

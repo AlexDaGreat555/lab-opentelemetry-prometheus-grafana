@@ -1,1 +1,0 @@
-histogram_quantile(0.95, sum by (le) (rate(METRIC_NAME[2m])))

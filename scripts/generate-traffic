@@ -28,14 +28,33 @@ request_host=$(resolve_request_host) || {
 }
 app_url="http://${request_host}:3000"
 prometheus_url="http://${request_host}:9090"
+profile=${1:-baseline}
+
+case "$profile" in
+  baseline)
+    successful_requests=8
+    not_found_requests=2
+    ;;
+  degraded)
+    successful_requests=2
+    not_found_requests=8
+    ;;
+  *)
+    printf 'Usage: %s [baseline|degraded]\n' "$0" >&2
+    exit 2
+    ;;
+esac
 
 send_burst() {
-  for _ in {1..8}; do
+  local request_number
+
+  for ((request_number = 1; request_number <= successful_requests; request_number++)); do
     curl --noproxy '*' --fail --silent --show-error \
       --output /dev/null "${app_url}/work"
   done
 
-  for suffix in missing-a missing-b; do
+  for ((request_number = 1; request_number <= not_found_requests; request_number++)); do
+    suffix="missing-${profile}-${request_number}"
     status=$(curl --noproxy '*' --silent --show-error \
       --output /dev/null --write-out '%{http_code}' "${app_url}/${suffix}")
     if [[ "$status" != "404" ]]; then
@@ -108,5 +127,6 @@ if ! read -r _second_timestamp _second_value < <(
   exit 1
 fi
 
-printf 'Generated 16 successful and 4 not-found GET requests.\n'
+printf 'Generated the %s profile: %d successful and %d not-found GET requests.\n' \
+  "$profile" "$((successful_requests * 2))" "$((not_found_requests * 2))"
 printf 'Prometheus observed both traffic bursts.\n'
