@@ -65,7 +65,14 @@ resolve_request_host() {
       http://host.docker.internal:3000/health >/dev/null 2>&1; then
     printf 'host.docker.internal'
   else
-    return 1
+    docker_gateway=$(ip route | awk '/^default/ {print $3; exit}')
+    if [[ -n "$docker_gateway" ]] && \
+      curl --noproxy '*' --fail --silent --max-time 0.5 \
+        "http://${docker_gateway}:3000/health" >/dev/null 2>&1; then
+      printf '%s' "$docker_gateway"
+    else
+      return 1
+    fi
   fi
 }
 
