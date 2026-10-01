@@ -1,2 +1,1 @@
-# TODO: Replace this comment with one PromQL expression that reports the
-# fraction of observed GET requests whose status is 200.
+sum(lab05_requests_total{method="GET", status="200"}) / sum(lab05_requests_total{method="GET"})
